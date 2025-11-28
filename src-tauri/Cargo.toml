@@ -1,0 +1,31 @@
+[package]
+name = "mcct"
+version = "0.1.0"
+description = "A Steam P2P tunneling tool for LAN games"
+authors = ["Moody"]
+edition = "2021"
+
+[lib]
+name = "mcct_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+native-dialog = "0.7.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# GitHub 最新版
+steamworks = { git = "https://github.com/Noxime/steamworks-rs" }
+# 直接调用底层 C 接口
+steamworks-sys = "0.11"
+tokio = { version = "1", features = ["full"] }
+nanoid = "0.4"
+bytes = "1.5"
+log = "0.4"
+env_logger = "0.10"
+thiserror = "1.0"
+anyhow = "1.0"
