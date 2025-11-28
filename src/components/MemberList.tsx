@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { MemberInfo } from "../types";
-import { Network, User } from "lucide-react";
+import {useEffect, useState} from "react";
+import {invoke} from "@tauri-apps/api/core";
+import {MemberInfo} from "../types";
+import {Network, User} from "lucide-react";
 
 export function MemberList() {
     const [members, setMembers] = useState<MemberInfo[]>([]);
@@ -36,15 +36,17 @@ export function MemberList() {
                     <tr key={member.id} className="hover:bg-white/5 transition-colors group">
                         <td className="p-4">
                             <div className="flex items-center gap-3">
-                                <div className="w-8 h-8 rounded bg-gradient-to-br from-slate-700 to-slate-800 flex items-center justify-center text-slate-400 group-hover:text-white transition-colors">
-                                    <User size={16} />
+                                <div
+                                    className="w-8 h-8 rounded bg-gradient-to-br from-slate-700 to-slate-800 flex items-center justify-center text-slate-400 group-hover:text-white transition-colors">
+                                    <User size={16}/>
                                 </div>
                                 <span className="font-medium text-slate-200">{member.name}</span>
                             </div>
                         </td>
                         <td className="p-4">
                             <div className="flex items-center gap-2">
-                                <Network size={14} className={member.ping < 100 ? "text-green-500" : "text-yellow-500"} />
+                                <Network size={14}
+                                         className={member.ping < 100 ? "text-green-500" : "text-yellow-500"}/>
                                 <span className="font-mono text-sm text-slate-400">
                     {member.ping === 0 ? "本机" : `${member.ping}ms`}
                   </span>

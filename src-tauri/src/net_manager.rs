@@ -3,13 +3,13 @@ use bytes::{Buf, BufMut, BytesMut};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use steamworks::{
-    networking_sockets::{ListenSocket, NetConnection},
+    networking_sockets::ListenSocket,
     networking_types::{ListenSocketEvent, SendFlags},
     SteamId,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const ID_LEN: usize = 7;
 const HEADER_SIZE: usize = ID_LEN + 4;
@@ -58,10 +58,7 @@ impl TunnelPacket {
     }
 }
 
-unsafe fn clone_net_conn(conn: &NetConnection) -> NetConnection {
-    std::ptr::read(conn)
-}
-
+// --- 公共函数 ---
 pub fn stop_network(state: &AppState) {
     let mut signal = state.stop_signal.lock().unwrap();
     if let Some(sender) = signal.take() {
@@ -78,29 +75,24 @@ pub async fn start_network_client(
     local_port: u16,
 ) -> Result<(), String> {
     stop_network(state);
-
     *state.local_game_port.lock().unwrap() = local_port;
 
     let networking = state.steam_client.networking_sockets();
     let net_identity = steamworks::networking_types::NetworkingIdentity::new_steam_id(host_id);
-    let connection = networking.connect_p2p(net_identity, 0, None);
 
-    if let Ok(conn) = connection {
-        log::info!("P2P Connect initiated to Host: {:?}", host_id);
-
-        let conn_for_list = unsafe { clone_net_conn(&conn) };
-        state.connections.lock().unwrap().push(conn_for_list);
-
-        let (tx_stop, rx_stop) = tokio::sync::oneshot::channel();
-        *state.stop_signal.lock().unwrap() = Some(tx_stop);
-        let state_client = state.steam_client.clone();
-
-        tokio::spawn(async move {
-            client_loop(state_client, conn, rx_stop, local_port).await;
-        });
-        Ok(())
-    } else {
-        Err("Failed to connect P2P".to_string())
+    match networking.connect_p2p(net_identity, 0, None) {
+        Ok(conn) => {
+            log::info!("P2P Connect initiated to Host: {:?}", host_id);
+            state.connections.lock().unwrap().push(conn);
+            let (tx_stop, rx_stop) = oneshot::channel();
+            *state.stop_signal.lock().unwrap() = Some(tx_stop);
+            let state_clone = state.clone();
+            tauri::async_runtime::spawn(async move {
+                client_loop(state_clone, rx_stop).await;
+            });
+            Ok(())
+        }
+        Err(_) => Err("Failed to connect P2P".to_string()),
     }
 }
 
@@ -112,62 +104,50 @@ pub fn start_network_host(state: &AppState) -> Result<(), String> {
         Ok(socket) => {
             log::info!("Started Hosting P2P Listen Socket");
             *state.is_host.lock().unwrap() = true;
-
-            let (tx_stop, rx_stop) = tokio::sync::oneshot::channel();
+            let (tx_stop, rx_stop) = oneshot::channel();
             *state.stop_signal.lock().unwrap() = Some(tx_stop);
-
-            let state_client = state.steam_client.clone();
-            let local_port = *state.local_game_port.lock().unwrap();
-            let connections = state.connections.clone();
-
-            tokio::spawn(async move {
-                host_loop(state_client, socket, local_port, rx_stop, connections).await;
+            let state_clone = state.clone();
+            tauri::async_runtime::spawn(async move {
+                host_loop(state_clone, socket, rx_stop).await;
             });
-
             Ok(())
         }
         Err(e) => Err(format!("Failed to start hosting: {:?}", e)),
     }
 }
 
+// --- Host 逻辑 ---
 struct HostOutgoingPacket {
-    target_conn: NetConnection,
+    target_steam_id: SteamId,
     packet: TunnelPacket,
 }
 
 async fn host_loop(
-    steam_client: steamworks::Client,
+    state: AppState,
     listen_socket: ListenSocket,
-    local_port: u16,
-    mut rx_stop: tokio::sync::oneshot::Receiver<()>,
-    connections: Arc<Mutex<Vec<NetConnection>>>,
+    mut rx_stop: oneshot::Receiver<()>,
 ) {
-    let _networking = steam_client.networking_sockets();
     type TcpSender = mpsc::UnboundedSender<Vec<u8>>;
     let socket_map: Arc<Mutex<HashMap<String, TcpSender>>> = Arc::new(Mutex::new(HashMap::new()));
     let (tx_p2p, mut rx_p2p) = mpsc::unbounded_channel::<HostOutgoingPacket>();
-
-    log::info!(
-        "Host Loop Started. Forwarding to local port: {}",
-        local_port
-    );
+    let local_port = *state.local_game_port.lock().unwrap();
 
     loop {
-        let sleep = tokio::time::sleep(std::time::Duration::from_millis(1));
-
         while let Some(event) = listen_socket.try_receive_event() {
             match event {
                 ListenSocketEvent::Connecting(request) => {
-                    log::info!("Incoming connection request");
                     let _ = request.accept();
                 }
                 ListenSocketEvent::Connected(connected) => {
                     log::info!("Client connected via ListenSocket");
-                    let conn = connected.take_connection();
-                    connections.lock().unwrap().push(conn);
+                    state
+                        .connections
+                        .lock()
+                        .unwrap()
+                        .push(connected.take_connection());
                 }
-                ListenSocketEvent::Disconnected(_) => {
-                    log::info!("Client disconnected");
+                ListenSocketEvent::Disconnected(_disconnected) => {
+                    log::info!("Client disconnected from ListenSocket, will be cleaned up during next poll.");
                 }
             }
         }
@@ -175,142 +155,116 @@ async fn host_loop(
         tokio::select! {
             Some(out) = rx_p2p.recv() => {
                 let data = out.packet.to_bytes();
-                if let Err(e) = out.target_conn.send_message(&data, SendFlags::RELIABLE) {
-                    log::error!("Failed to send P2P message: {:?}", e);
+                let mut conns_guard = state.connections.lock().unwrap();
+                let sockets = state.steam_client.networking_sockets();
+                if let Some(conn) = conns_guard.iter_mut().find(|c| {
+                    sockets.get_connection_info(c).ok()
+                        .and_then(|info| info.identity_remote().and_then(|id| id.steam_id())) == Some(out.target_steam_id)
+                }) {
+                    let _ = conn.send_message(&data, SendFlags::RELIABLE);
                 }
             }
-            _ = sleep => {
-                let mut conns = connections.lock().unwrap();
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                let mut conns_guard = state.connections.lock().unwrap();
                 let mut dead_indices = Vec::new();
+                let sockets = state.steam_client.networking_sockets();
 
-                for (i, conn) in conns.iter_mut().enumerate() {
+                for (i, conn) in conns_guard.iter_mut().enumerate() {
                     match conn.receive_messages(10) {
                         Ok(messages) => {
                             for msg in messages {
-                                let data = msg.data();
-                                if let Some(packet) = TunnelPacket::from_bytes(data) {
-                                    let client_id = packet.client_id.clone();
-
-                                    if packet.msg_type == 1 {
-                                        let mut map = socket_map.lock().unwrap();
-                                        map.remove(&client_id);
-                                        continue;
-                                    }
-
-                                    let mut map = socket_map.lock().unwrap();
-                                    if let Some(sender) = map.get(&client_id) {
-                                        let _ = sender.send(packet.payload);
-                                    } else {
-                                        log::info!("New TCP Client {} -> Local:{}", client_id, local_port);
-                                        let conn_clone = unsafe { clone_net_conn(conn) };
-                                        spawn_local_bridge(client_id.clone(), local_port, conn_clone, tx_p2p.clone(), &mut map);
+                                if let Ok(info) = sockets.get_connection_info(conn) {
+                                    if let (Some(packet), Some(remote_id)) = (TunnelPacket::from_bytes(msg.data()), info.identity_remote().and_then(|id| id.steam_id())) {
+                                        let client_id = packet.client_id.clone();
+                                        let mut map_guard = socket_map.lock().unwrap();
+                                        if !map_guard.contains_key(&client_id) && packet.msg_type == 0 {
+                                            spawn_local_bridge_host(client_id.clone(), local_port, remote_id, tx_p2p.clone(), &mut map_guard);
+                                        }
+                                        if let Some(sender) = map_guard.get(&client_id) {
+                                            let _ = sender.send(packet.payload);
+                                        }
+                                        if packet.msg_type == 1 {
+                                            map_guard.remove(&client_id);
+                                        }
                                     }
                                 }
                             }
                         },
-                        Err(_) => {
-                            dead_indices.push(i);
-                        }
+                        Err(_) => { dead_indices.push(i); }
                     }
                 }
-
-                for i in dead_indices.iter().rev() {
-                    conns.remove(*i);
-                }
+                for i in dead_indices.iter().rev() { conns_guard.remove(*i); }
             }
             _ = &mut rx_stop => { break; }
         }
     }
 }
 
-fn spawn_local_bridge(
+fn spawn_local_bridge_host(
     client_id: String,
     local_port: u16,
-    conn_clone: NetConnection,
+    target_steam_id: SteamId,
     tx_p2p: mpsc::UnboundedSender<HostOutgoingPacket>,
     map: &mut HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
 ) {
     let (tx_tcp, mut rx_tcp) = mpsc::unbounded_channel::<Vec<u8>>();
     map.insert(client_id.clone(), tx_tcp);
 
-    tokio::spawn(async move {
-        match TcpStream::connect(("127.0.0.1", local_port)).await {
-            Ok(stream) => {
-                let (mut rd, mut wr) = stream.into_split();
-                let id_clone = client_id.clone();
-                let conn_clone_2 = unsafe { clone_net_conn(&conn_clone) };
-                let tx_p2p_2 = tx_p2p.clone();
-
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 1024];
-                    loop {
-                        match rd.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                let p = TunnelPacket {
-                                    client_id: id_clone.clone(),
-                                    msg_type: 0,
-                                    payload: buf[0..n].to_vec(),
-                                };
-                                if tx_p2p_2
-                                    .send(HostOutgoingPacket {
-                                        target_conn: unsafe { clone_net_conn(&conn_clone_2) },
-                                        packet: p,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
+    tauri::async_runtime::spawn(async move {
+        if let Ok(stream) = TcpStream::connect(("127.0.0.1", local_port)).await {
+            let (mut rd, mut wr) = stream.into_split();
+            let id_clone_read = client_id.clone();
+            let tx_p2p_read = tx_p2p.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                while let Ok(n) = rd.read(&mut buf).await {
+                    if n == 0 {
+                        break;
                     }
-                    let _ = tx_p2p_2.send(HostOutgoingPacket {
-                        target_conn: unsafe { clone_net_conn(&conn_clone_2) },
-                        packet: TunnelPacket {
-                            client_id: id_clone,
-                            msg_type: 1,
-                            payload: vec![],
-                        },
-                    });
-                });
-
-                while let Some(data) = rx_tcp.recv().await {
-                    if wr.write_all(&data).await.is_err() {
+                    let p = TunnelPacket {
+                        client_id: id_clone_read.clone(),
+                        msg_type: 0,
+                        payload: buf[0..n].to_vec(),
+                    };
+                    if tx_p2p_read
+                        .send(HostOutgoingPacket {
+                            target_steam_id,
+                            packet: p,
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
-            }
-            Err(e) => {
-                log::error!(
-                    "Failed to connect to local game server {}: {}",
-                    local_port,
-                    e
-                );
+                let p_disconnect = TunnelPacket {
+                    client_id: id_clone_read,
+                    msg_type: 1,
+                    payload: vec![],
+                };
+                let _ = tx_p2p_read.send(HostOutgoingPacket {
+                    target_steam_id,
+                    packet: p_disconnect,
+                });
+            });
+            while let Some(data) = rx_tcp.recv().await {
+                if wr.write_all(&data).await.is_err() {
+                    break;
+                }
             }
         }
     });
 }
 
-async fn client_loop(
-    steam_client: steamworks::Client,
-    conn: NetConnection,
-    mut rx_stop: tokio::sync::oneshot::Receiver<()>,
-    local_port: u16,
-) {
-    let _networking = steam_client.networking_sockets();
+// --- Client 逻辑 ---
+async fn client_loop(state: AppState, mut rx_stop: oneshot::Receiver<()>) {
+    let local_port = *state.local_game_port.lock().unwrap();
     let listener = match TcpListener::bind(("127.0.0.1", local_port)).await {
         Ok(l) => l,
-        Err(e) => {
-            log::error!("Bind local port {} failed: {}", local_port, e);
-            return;
-        }
+        Err(_) => return,
     };
-
-    type SocketMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
-    let socket_map: SocketMap = Arc::new(Mutex::new(HashMap::new()));
+    let socket_map: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let (tx_p2p, mut rx_p2p) = mpsc::channel::<TunnelPacket>(100);
-    let socket_map_reader = socket_map.clone();
 
     loop {
         tokio::select! {
@@ -318,36 +272,21 @@ async fn client_loop(
                 let id = nanoid::nanoid!(6);
                 let (mut rd, mut wr) = socket.into_split();
                 let (tx_socket, mut rx_socket) = mpsc::channel::<Vec<u8>>(100);
-                {
-                    let mut map = socket_map.lock().unwrap();
-                    map.insert(id.clone(), tx_socket);
-                }
-                let tx_p2p_clone = tx_p2p.clone();
-                let id_clone = id.clone();
-                let map_clone = socket_map.clone();
+                socket_map.lock().unwrap().insert(id.clone(), tx_socket);
 
+                let tx_p2p_clone = tx_p2p.clone();
+                let id_clone_read = id.clone();
+                let map_clone_read = socket_map.clone();
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 1024];
-                    loop {
-                        match rd.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                let packet = TunnelPacket {
-                                    client_id: id_clone.clone(),
-                                    msg_type: 0,
-                                    payload: buf[0..n].to_vec(),
-                                };
-                                if tx_p2p_clone.send(packet).await.is_err() { break; }
-                            }
-                            Err(_) => break,
-                        }
+                    let mut buf = vec![0u8; 2048];
+                    while let Ok(n) = rd.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let packet = TunnelPacket { client_id: id_clone_read.clone(), msg_type: 0, payload: buf[0..n].to_vec() };
+                        if tx_p2p_clone.send(packet).await.is_err() { break; }
                     }
-                    let packet = TunnelPacket { client_id: id_clone.clone(), msg_type: 1, payload: vec![] };
+                    let packet = TunnelPacket { client_id: id_clone_read.clone(), msg_type: 1, payload: vec![] };
                     let _ = tx_p2p_clone.send(packet).await;
-                    {
-                        let mut map = map_clone.lock().unwrap();
-                        map.remove(&id_clone);
-                    }
+                    map_clone_read.lock().unwrap().remove(&id_clone_read);
                 });
 
                 tokio::spawn(async move {
@@ -358,28 +297,29 @@ async fn client_loop(
             }
             Some(packet) = rx_p2p.recv() => {
                 let data = packet.to_bytes();
-                if let Err(e) = conn.send_message(&data, SendFlags::RELIABLE) {
-                    log::error!("Send client p2p error: {:?}", e);
+                let mut conns = state.connections.lock().unwrap();
+                if let Some(conn) = conns.iter_mut().next() {
+                    let _ = conn.send_message(&data, SendFlags::RELIABLE);
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
-               let mut conn_clone = unsafe { clone_net_conn(&conn) };
-               if let Ok(messages) = conn_clone.receive_messages(10) {
-                   for msg in messages {
-                       let data = msg.data();
-                       if let Some(packet) = TunnelPacket::from_bytes(data) {
-                           if packet.msg_type == 0 {
-                                let map = socket_map_reader.lock().unwrap();
-                                if let Some(sender) = map.get(&packet.client_id) {
-                                    let _ = sender.try_send(packet.payload);
-                                }
-                           } else if packet.msg_type == 1 {
-                               let mut map = socket_map_reader.lock().unwrap();
-                               map.remove(&packet.client_id);
-                           }
-                       }
-                   }
-               }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                let mut conns = state.connections.lock().unwrap();
+                if let Some(conn) = conns.iter_mut().next() {
+                    if let Ok(messages) = conn.receive_messages(10) {
+                        for msg in messages {
+                            if let Some(packet) = TunnelPacket::from_bytes(msg.data()) {
+                               let map = socket_map.lock().unwrap();
+                               if let Some(sender) = map.get(&packet.client_id) {
+                                   let _ = sender.try_send(packet.payload);
+                               }
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                } else if !(*state.is_host.lock().unwrap()) {
+                    break;
+                }
             }
             _ = &mut rx_stop => { break; }
         }

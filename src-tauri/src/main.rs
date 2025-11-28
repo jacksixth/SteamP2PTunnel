@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_state;
-mod error;
 mod net_manager;
 mod steam_commands;
 
@@ -40,7 +39,7 @@ async fn main() {
                 .set_text(&format!("无法连接到 Steam 客户端。\n请确保 Steam 正在运行并且您已登录。\n\n错误详情: {}", e))
                 .set_type(MessageType::Error)
                 .show_alert()
-                .unwrap(); // .show_alert() 会阻塞直到用户点击 OK
+                .unwrap();
 
             return;
         }
@@ -104,7 +103,6 @@ async fn main() {
             }
             Ok(NetworkingConnectionState::Connected) => {
                 println!("Connection established.");
-                // 再次检查，防止 Connecting 后立即断开又触发 Connected
                 let is_host = *is_host_arc.lock().unwrap();
                 let in_lobby = current_lobby_arc.lock().unwrap().is_some();
                 if !is_host && !in_lobby {
@@ -174,7 +172,6 @@ async fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    // 这行代码会阻塞，直到所有 Tauri 窗口都关闭
     app.run(|_app_handle, event| match event {
         tauri::RunEvent::ExitRequested { api, .. } => {
             println!("Tauri exit requested. Cleaning up network tasks...");

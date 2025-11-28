@@ -1,8 +1,8 @@
 // src/AppContext.tsx
 
-import { createContext, useState, useContext, ReactNode, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { NetworkStatus } from './types';
+import {createContext, ReactNode, useContext, useEffect, useState} from 'react';
+import {invoke} from '@tauri-apps/api/core';
+import {NetworkStatus} from './types';
 
 // AppState 现在可以简化
 interface AppState {
@@ -23,10 +23,10 @@ const initialNetworkStatus: NetworkStatus = {
     isConnected: false,
     tcpClientCount: 0,
     statusMessage: 'Initializing...',
-    ping: 0, // 初始 ping 为 0
+    ping: 0,
 };
 
-export const AppProvider = ({ children }: { children: ReactNode }) => {
+export const AppProvider = ({children}: { children: ReactNode }) => {
     const [state, setState] = useState<AppState>({
         networkStatus: initialNetworkStatus,
         currentLobbyId: null,
@@ -35,11 +35,11 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
 
     const setLocalPort = (port: number) => {
         localStorage.setItem("mcct_last_port", port.toString());
-        setState(prevState => ({ ...prevState, localPort: port }));
+        setState(prevState => ({...prevState, localPort: port}));
     };
 
     const setCurrentLobbyId = (id: string | null) => {
-        setState(prevState => ({ ...prevState, currentLobbyId: id }));
+        setState(prevState => ({...prevState, currentLobbyId: id}));
     };
 
     useEffect(() => {
@@ -54,7 +54,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
                 console.error("Failed to get network status:", e);
                 setState(prevState => ({
                     ...prevState,
-                    networkStatus: { ...initialNetworkStatus, statusMessage: 'Connection Error' },
+                    networkStatus: {...initialNetworkStatus, statusMessage: 'Connection Error'},
                 }));
             }
         }, 1000);
@@ -62,7 +62,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
         return () => clearInterval(interval);
     }, []);
 
-    const value = { ...state, setLocalPort, setCurrentLobbyId };
+    const value = {...state, setLocalPort, setCurrentLobbyId};
     return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 };
 
